@@ -341,7 +341,7 @@ class StaticBaseStockPolicyRandom:
 
 
 # Policy Lieve
-class MySmartPolicy:
+class DynamicPolicy:
     """
     Implements a smart policy for inventory management in a multi-echelon supply chain.
 
