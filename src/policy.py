@@ -652,12 +652,16 @@ class StaticPolicy:
         echelon_inventory = self._compute_echelon_inventory(state)
         base_stock_levels = self._get_base_stock_levels()
         potential_action = [math.ceil(self.config.avg_demand_per_comp[i] * (1 + self.comp_h_params[i])) for i in range(self.config.num_components)]
-
+    
         action_per_node = list(potential_action)
+        
+        # Handle infeasible actions (checking for capacity constraints)
         for i in range(self.config.num_nodes):
             group_indices = self.config.capacity_groups_indices[i]
             group_production = sum([action_per_node[j] for j in group_indices])
             capacity = self.config.capacities[i]
+    
+            # If group production exceeds capacity, make the action feasible
             if group_production > capacity:
                 reduction_needed = group_production - capacity
                 total_potential = sum([action_per_node[j] for j in group_indices])
@@ -669,12 +673,15 @@ class StaticPolicy:
                         reduction_needed -= reduction
                         if reduction_needed <= 0:
                             break
-                self.shortage_counts[i] += 1
-
+                    self.shortage_counts[i] += 1
+    
+        # Handle shortages for subcomponents
         for i in range(self.config.num_sub_components):
             successors = self.config.successors[i]
             needed_by_successors = sum([action_per_node[j] for j in successors])
             available_inventory = state.inventory_per_node[i]
+            
+            # If needed by successors exceeds available inventory, reduce the action
             if needed_by_successors > available_inventory:
                 reduction_needed = needed_by_successors - available_inventory
                 total_successor_action = sum([action_per_node[j] for j in successors])
@@ -686,5 +693,9 @@ class StaticPolicy:
                         reduction_needed -= reduction
                         if reduction_needed <= 0:
                             break
-
+    
+        # If no adjustments were made and the action is still infeasible, raise an exception like the original DynamicPolicyShort did
+        if any(action < 0 for action in action_per_node):
+            raise Exception("Action is not feasible")
+    
         return action_per_node
