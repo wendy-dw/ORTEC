@@ -582,17 +582,14 @@ class StaticPolicy:
     """
     Implements a condensed policy for inventory management without using historical demand data and without dynamic hedging.
     """
-    def __init__(self, config, h=0.1, shortage_history_length=20):
+    def __init__(self, config, h=0.1):
         self.config = config
         self.h = h
-        self.shortage_history_length = shortage_history_length
         self.comp_to_node = self._map_comp_to_node()
         self.num_nodes = len(config.capacities)
         self.node_to_comps = self._map_node_to_comps()
         self.shortage_counts = {i: 0 for i in range(self.num_nodes)}
         self.comp_h_params = [h] * config.num_components
-        self.shortage_history = [([False] * config.num_components) for _ in range(shortage_history_length)]
-        self.history_index = 0
         self.node_importance = [0.0] * self.num_nodes
         self.demand_variability = getattr(config, "demand_variability_per_comp", [0.1] * config.num_components)
         self.base_stock_levels = self._get_base_stock_levels()
@@ -616,14 +613,31 @@ class StaticPolicy:
         max_deps = max(node_deps) if node_deps else 1
         self.node_importance = [(deps / max_deps) + 0.1 for deps in node_deps]
 
+    def _get_echelon_lead_times(self):
+        L = [[0 for _ in range(self.config.num_components)] for _ in range(self.config.num_products)]
+        for i in range(self.config.num_products):
+            root = self.config.num_sub_components + i
+            L[i][root] = self.config.lead_times[root]
+            for pred in self.config.predecessors[root]:
+                L[i][pred] = L[i][root] + self.config.lead_times[pred]
+                for pred2 in self.config.predecessors[pred]:
+                    L[i][pred2] = L[i][pred] + self.config.lead_times[pred2]
+        return [[lt + 1 if lt > 0 else lt for lt in prod_lts] for prod_lts in L]
+
     def _get_base_stock_levels(self):
-        self._calc_node_importance()
+        echelon_lead_times = self._get_echelon_lead_times()
         levels = [0] * self.config.num_components
+        self._calc_node_importance()
         for i in range(self.config.num_products):
             for j in range(self.config.num_components):
                 demand = self.config.avg_demand_per_product[i]
+                lt = echelon_lead_times[i][j]
                 node_importance = self.node_importance[self.comp_to_node[j]]
-                levels[j] += demand * (1 + (node_importance - 0.1) * 3)
+                levels[j] += demand * (lt + 1) * (1 + (node_importance - 0.1) * 3)
+        for node_index, shortage_count in self.shortage_counts.items():
+            if shortage_count > 5:
+                for j in self.node_to_comps[node_index]:
+                    levels[j] *= 1.2
         return [math.ceil(level * (1 + self.h)) for level in levels]
 
     def _compute_echelon_inventory(self, state):
@@ -651,51 +665,49 @@ class StaticPolicy:
     def set_action(self, state):
         echelon_inventory = self._compute_echelon_inventory(state)
         base_stock_levels = self._get_base_stock_levels()
+
         potential_action = [math.ceil(self.config.avg_demand_per_comp[i] * (1 + self.comp_h_params[i])) for i in range(self.config.num_components)]
-    
+
+        capacity_group_priority = sorted(self.shortage_counts.items(), key=lambda item: item[1], reverse=True)
+        component_order = [c for group_index, _ in capacity_group_priority for c in self.config.capacity_groups_indices[group_index]] + [i for i in range(self.config.num_components) if i not in [c for group_index, _ in capacity_group_priority for c in self.config.capacity_groups_indices[group_index]]]
+
+        product_echelon_shortfalls = {self.config.num_sub_components + i: base_stock_levels[self.config.num_sub_components + i] - echelon_inventory[self.config.num_sub_components + i] for i in range(self.config.num_products)}
+
+        weighted_potential_action = [0] * self.config.num_components
+        for i in component_order:
+            base_demand = math.ceil(self.config.avg_demand_per_comp[i] * (1 + self.h))
+            weight = 1.0
+            for product_index in range(self.config.num_products):
+                final_product_index = self.config.num_sub_components + product_index
+                component_name = f"C{i + 1}"
+                product_name = self.config.bill_of_materials.index[final_product_index]
+                if (component_name in self.config.bill_of_materials.columns and
+                        self.config.bill_of_materials.loc[product_name, component_name] == 1):
+                    weight += (product_echelon_shortfalls.get(final_product_index, 0) / (base_stock_levels[final_product_index] + 1e-9)) * 0.05
+            weighted_potential_action[i] = math.ceil(base_demand * weight)
+            potential_action[i] = weighted_potential_action[i]
+
         action_per_node = list(potential_action)
-        
-        # Handle infeasible actions (checking for capacity constraints)
+
+
+        # Enforce Capacity Constraints (Immediate Adjustment)
         for i in range(self.config.num_nodes):
             group_indices = self.config.capacity_groups_indices[i]
-            group_production = sum([action_per_node[j] for j in group_indices])
             capacity = self.config.capacities[i]
-    
-            # If group production exceeds capacity, make the action feasible
-            if group_production > capacity:
-                reduction_needed = group_production - capacity
-                total_potential = sum([action_per_node[j] for j in group_indices])
-                if total_potential > 0:
-                    reduction_factors = [action_per_node[j] / total_potential for j in group_indices]
-                    for index, comp_index in enumerate(group_indices):
-                        reduction = math.ceil(reduction_needed * reduction_factors[index])
-                        action_per_node[comp_index] = max(0, action_per_node[comp_index] - reduction)
-                        reduction_needed -= reduction
-                        if reduction_needed <= 0:
-                            break
-                    self.shortage_counts[i] += 1
-    
-        # Handle shortages for subcomponents
+            current_group_production = sum([action_per_node[j] for j in group_indices])
+            if current_group_production > capacity:
+                excess_ratio = capacity / current_group_production if current_group_production > 0 else 1.0
+                for comp_index in group_indices:
+                    action_per_node[comp_index] = math.floor(action_per_node[comp_index] * excess_ratio)
+
+        # Enforce Material Availability Constraints (Immediate Adjustment)
         for i in range(self.config.num_sub_components):
             successors = self.config.successors[i]
             needed_by_successors = sum([action_per_node[j] for j in successors])
             available_inventory = state.inventory_per_node[i]
-            
-            # If needed by successors exceeds available inventory, reduce the action
             if needed_by_successors > available_inventory:
-                reduction_needed = needed_by_successors - available_inventory
-                total_successor_action = sum([action_per_node[j] for j in successors])
-                if total_successor_action > 0:
-                    reduction_factors = [action_per_node[j] / total_successor_action for j in successors]
-                    for index, successor_index in enumerate(successors):
-                        reduction = math.ceil(reduction_needed * reduction_factors[index])
-                        action_per_node[successor_index] = max(0, action_per_node[successor_index] - reduction)
-                        reduction_needed -= reduction
-                        if reduction_needed <= 0:
-                            break
-    
-        # If no adjustments were made and the action is still infeasible, raise an exception like the original DynamicPolicyShort did
-        if any(action < 0 for action in action_per_node):
-            raise Exception("Action is not feasible")
-    
+                shortage_ratio = available_inventory / needed_by_successors if needed_by_successors > 0 else 0
+                for successor_index in successors:
+                    action_per_node[successor_index] = math.floor(action_per_node[successor_index] * shortage_ratio)
+
         return action_per_node
