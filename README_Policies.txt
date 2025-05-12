@@ -14,6 +14,7 @@ All policies take production capacity and availability of needed materials into 
 ----------------------------------------------------------------------------------------------------------------------------------
 
 MeanDemandPolicy simply uses the mean demand for production. Decisions on which parts to make are generated in a random order. 
+
 StaticBaseStockPolicyShortfall defines base-stock levels for each component based on how long it takes to make that part (i.e. lead times) and the average demand. These base-stock levels are the target inventory values to minimise shortfalls. For production, the current inventory levels are taken into account, as well as the parts that use other parts for production. It furthermore prioritises bottlenecks in terms of parts that can cause shortages further in the supply chain when parts cannot be produced simultaneously. Other nodes are handled randomly.
 
 StaticBaseStockPolicyRandom is similar to StaticBaseStockPolicyShortfall in how it defines base-stock levels, with the addition that deviations can be provided during initialisation. This way, for example, promotions can be prepared for be defining that more of certain nodes should be produced. Furthermore, this policy does not prioritise bottleneck nodes like StaticBaseStockPolicyShortfall does, but it handles each node equally in random order.
